@@ -1,0 +1,345 @@
+#!/usr/bin/python3 -I
+"""claude-sleeper: put long-idle Claude Code sessions in herdr panes to sleep.
+
+For every claude agent herdr knows about, the session is put to sleep when ALL hold:
+  - herdr does not report the agent as working or blocked, and the pane is not focused
+  - claude's own registry (~/.claude/sessions/<pid>.json) says status=idle
+  - no activity for --idle-hours (newest of: registry statusUpdatedAt,
+    last timestamped transcript entry)
+  - claude has no background Bash jobs running (children using shell-snapshots)
+
+Sleeping = record the session in ~/.local/state/claude-sleeper/<session-id>.json,
+SIGTERM claude (it exits cleanly; the transcript is already on disk), then type
+" claude-wake <session-id>" into the pane's shell. claude-wake shows a sleeping
+screen and execs `claude --resume <id>` on a keypress.
+
+If the pane's shell is still busy after claude exits (slow prompt hooks such as a
+direnv reload), later runs type the wake command once it is free (wake_pending).
+"""
+import argparse
+import fcntl
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+STATE_DIR = HOME / ".local/state/claude-sleeper"
+REGISTRY_DIR = HOME / ".claude/sessions"
+PROJECTS_DIR = HOME / ".claude/projects"
+WAKE = shutil.which("claude-wake") or str(HOME / ".local/bin/claude-wake")
+PENDING_GIVE_UP_SECS = 2 * 3600  # stop trying to type a pending wake command after this
+HERDR = shutil.which("herdr") or str(HOME / ".local/bin/herdr")
+
+# claude CLI flags: how many values each takes (0, 1, "?" optional, "*" variadic).
+ARITY = {
+    "--add-dir": "*", "--agent": 1, "--agents": 1, "--allowedTools": "*", "--allowed-tools": "*",
+    "--append-system-prompt": 1, "--autocompact": 1, "--betas": "*", "--cloud": "?",
+    "-d": "?", "--debug": "?", "--debug-file": 1, "--disallowedTools": "*",
+    "--disallowed-tools": "*", "--effort": 1, "--environment": 1, "--fallback-model": 1,
+    "--file": "*", "--from-pr": "?", "--input-format": 1, "--json-schema": 1,
+    "--max-budget-usd": 1, "--mcp-config": "*", "--model": 1, "-n": 1, "--name": 1,
+    "--output-format": 1, "--permission-mode": 1, "--permission-prompts": 1,
+    "--permission-prompt-tool": 1, "--plugin-dir": 1, "--plugin-url": 1,
+    "--prompt-suggestions": "?", "--remote-control": "?",
+    "--remote-control-session-name-prefix": 1, "-r": "?", "--resume": "?",
+    "--session-id": 1, "--setting-sources": 1, "--settings": 1, "--system-prompt": 1,
+    "--system-prompt-snapshot": 1, "--teleport": "?", "--tools": "*", "-w": "?",
+    "--worktree": "?",
+}
+# Flags worth carrying over to the resumed session. Everything else (resume/continue,
+# worktree creation, print mode, the initial prompt, ...) is dropped.
+KEEP = {
+    "--add-dir", "--agent", "--agents", "--allowedTools", "--allowed-tools",
+    "--append-system-prompt", "--autocompact", "--betas", "--brief", "--chrome", "--no-chrome",
+    "-d", "--debug", "--debug-file", "--disable-slash-commands", "--disallowedTools",
+    "--disallowed-tools", "--effort", "--fallback-model", "--ide", "--mcp-config", "--model",
+    "-n", "--name", "--permission-mode", "--dangerously-skip-permissions",
+    "--allow-dangerously-skip-permissions", "--plugin-dir", "--plugin-url",
+    "--remote-control", "--remote-control-session-name-prefix", "--setting-sources",
+    "--settings", "--strict-mcp-config", "--system-prompt", "--tools", "--verbose",
+    "--bare", "--safe-mode", "--restricted",
+}
+# Dropped silently: they pick which session to open, and the wake replaces that choice.
+EXPECTED_DROPS = {"-r", "--resume", "-c", "--continue", "--session-id", "--fork-session"}
+
+
+def log(msg):
+    print(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}", flush=True)
+
+
+class HerdrError(Exception):
+    pass
+
+
+def herdr(session, *args):
+    cmd = [HERDR] + (["--session", session] if session else []) + list(args)
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if p.returncode != 0:
+        raise HerdrError(f"{' '.join(args[:2])}: {(p.stderr or p.stdout).strip()[:300]}")
+    if not p.stdout.strip():  # e.g. `pane run` prints nothing on success
+        return {}
+    return json.loads(p.stdout)["result"]
+
+
+def resume_args(argv):
+    """Split claude's original argv into (kept flags, dropped tokens)."""
+    keep, dropped, toks, i = [], [], argv[1:], 0
+    while i < len(toks):
+        t = toks[i]
+        i += 1
+        if not t.startswith("-") or t == "-":
+            dropped.append(t)  # positional: the initial prompt
+            continue
+        flag, has_inline = (t.split("=", 1)[0], True) if "=" in t else (t, False)
+        group = [t]
+        arity = ARITY.get(flag, 0)
+        if not has_inline:
+            if arity == 1 and i < len(toks):
+                group.append(toks[i]); i += 1
+            elif arity == "?" and i < len(toks) and not toks[i].startswith("-"):
+                group.append(toks[i]); i += 1
+            elif arity == "*":
+                while i < len(toks) and not toks[i].startswith("-"):
+                    group.append(toks[i]); i += 1
+        if flag in KEEP:
+            keep.extend(group)
+        elif flag not in EXPECTED_DROPS:
+            dropped.extend(group)
+    return keep, dropped
+
+
+def last_transcript_ts(session_id):
+    """Timestamp of the newest timestamped entry in the session transcript (or None).
+    Untimestamped metadata lines (cost-state, bridge-session, ...) are appended
+    periodically, so file mtime is not a usable activity signal."""
+    paths = list(PROJECTS_DIR.glob(f"*/{session_id}.jsonl"))
+    if not paths:
+        return None
+    with open(paths[0], "rb") as f:
+        f.seek(0, os.SEEK_END)
+        f.seek(max(0, f.tell() - 512 * 1024))
+        lines = f.read().splitlines()
+    for line in reversed(lines):
+        try:
+            ts = json.loads(line).get("timestamp")
+        except (ValueError, AttributeError):
+            continue
+        if ts:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    return None
+
+
+def background_jobs(pid):
+    """Children of claude that are Bash-tool commands (background jobs, monitors)."""
+    jobs = []
+    for task in Path(f"/proc/{pid}/task").glob("*/children"):
+        for child in task.read_text().split():
+            try:
+                cmd = Path(f"/proc/{child}/cmdline").read_bytes().replace(b"\0", b" ").decode()
+            except OSError:
+                continue
+            if "/.claude/shell-snapshots/" in cmd:
+                jobs.append(child)
+    return jobs
+
+
+def read_registry(pid):
+    try:
+        return json.loads((REGISTRY_DIR / f"{pid}.json").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def evaluate(agent, session, idle_secs, now, ignore_focus=False):
+    """Return (verdict, reason, info). verdict: 'sleep' or 'skip'."""
+    pane = agent["pane_id"]
+    info = {"pane_id": pane, "title": agent.get("terminal_title_stripped") or ""}
+    # 'unknown' is what herdr reports for a resumed claude until its next turn;
+    # claude's own registry status (checked below) is the authority then.
+    if agent.get("agent_status") not in ("idle", "done", "unknown"):
+        return "skip", f"herdr status {agent.get('agent_status')}", info
+    if agent.get("focused") and not ignore_focus:
+        return "skip", "pane is focused", info
+    procs = herdr(session, "pane", "process-info", "--pane", pane)["process_info"]
+    claudes = [p for p in procs["foreground_processes"]
+               if p["name"] == "claude" or os.path.basename(p["argv"][0]) == "claude"]
+    if len(claudes) != 1:
+        return "skip", f"{len(claudes)} claude processes in foreground", info
+    proc = claudes[0]
+    pid = proc["pid"]
+    info.update(pid=pid, cwd=proc["cwd"], argv=proc["argv"], shell_pid=procs["shell_pid"])
+    reg = read_registry(pid)
+    if not reg:
+        return "skip", "no claude session registry entry", info
+    info["registry_updated"] = reg.get("statusUpdatedAt")
+    sid = reg.get("sessionId") or (agent.get("agent_session") or {}).get("value")
+    if not sid:
+        return "skip", "unknown session id", info
+    info.update(session_id=sid, name=reg.get("name"))
+    if reg.get("status") != "idle":
+        return "skip", f"claude status {reg.get('status')}", info
+    jobs = background_jobs(pid)
+    if jobs:
+        return "skip", f"{len(jobs)} background job(s) running", info
+    seen = [t for t in (reg.get("statusUpdatedAt", 0) / 1000, last_transcript_ts(sid)) if t]
+    if not seen:
+        return "skip", "no activity timestamp", info
+    last = max(seen)
+    info["idle_since"] = last
+    idle_h = (now - last) / 3600
+    info["idle_h"] = idle_h
+    if now - last < idle_secs:
+        return "skip", f"idle {idle_h:.1f}h", info
+    return "sleep", f"idle {idle_h:.1f}h", info
+
+
+def put_to_sleep(info, session):
+    pid, sid, pane = info["pid"], info["session_id"], info["pane_id"]
+    # Re-check right before acting: the user may have just come back.
+    reg = read_registry(pid)
+    if not reg or reg.get("status") != "idle" or reg.get("statusUpdatedAt") != info["registry_updated"]:
+        return "session became active, left alone"
+    keep, dropped = resume_args(info["argv"])
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state = {
+        "session_id": sid, "name": info.get("name"), "title": info["title"], "cwd": info["cwd"],
+        "resume_args": keep, "dropped_args": dropped, "original_argv": info["argv"],
+        "pane_id": pane, "herdr_session": session, "idle_since": info["idle_since"],
+        "slept_at": time.time(),
+    }
+    state_file = STATE_DIR / f"{sid}.json"
+    state_file.write_text(json.dumps(state, indent=1))
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(60):
+        if not Path(f"/proc/{pid}").exists():
+            break
+        time.sleep(0.25)
+    else:
+        state_file.unlink(missing_ok=True)
+        return "ERROR: claude did not exit within 15s after SIGTERM; left it running"
+    note = f" (dropped args: {' '.join(dropped)})" if dropped else ""
+    # Prompt hooks (e.g. direnv) may keep the shell busy for a while after claude
+    # exits; then later runs type the wake command once the shell is free.
+    for _ in range(40):
+        busy = shell_busy(session, pane)
+        if not busy:
+            herdr(session, "pane", "run", pane, f" {WAKE} {sid}")
+            return f"asleep{note}"
+        time.sleep(0.25)
+    state["wake_pending"] = True
+    state_file.write_text(json.dumps(state, indent=1))
+    return f"asleep, wake screen pending: shell busy with `{busy[:80]}`{note}"
+
+
+def shell_busy(session, pane):
+    """None if the pane's shell is at its prompt, else the busy foreground command."""
+    procs = herdr(session, "pane", "process-info", "--pane", pane)["process_info"]
+    fg = procs["foreground_processes"]
+    if len(fg) == 1 and fg[0]["pid"] == procs["shell_pid"]:
+        return None
+    return " | ".join(p["cmdline"] for p in fg if p["pid"] != procs["shell_pid"]) or "?"
+
+
+def finish_pending(session, dry_run):
+    """Type the wake command into panes whose shell was busy when they went to sleep."""
+    for f in sorted(STATE_DIR.glob("*.json")):
+        try:
+            st = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if not st.get("wake_pending") or st.get("herdr_session") != session:
+            continue
+        sid, pane = st["session_id"], st["pane_id"]
+        label = f"{pane:8} {(st.get('name') or '')[:26]:26} {st.get('title', '')[:40]:40}"
+        if time.time() - st["slept_at"] > PENDING_GIVE_UP_SECS:
+            # Someone may be using the shell by now; don't type into it unannounced.
+            st["wake_pending"] = False
+            f.write_text(json.dumps(st, indent=1))
+            log(f"{label} gave up typing the wake command; resume with: claude-wake {sid}")
+            continue
+        try:
+            busy = shell_busy(session, pane)
+            if busy:
+                log(f"{label} wake screen still pending (shell busy with `{busy[:80]}`)")
+                continue
+            if dry_run:
+                log(f"{label} would type the pending wake command")
+                continue
+            herdr(session, "pane", "run", pane, f" {WAKE} {sid}")
+        except (HerdrError, OSError, subprocess.TimeoutExpired) as e:
+            log(f"{label} pending wake failed: {e}")
+            continue
+        st["wake_pending"] = False
+        f.write_text(json.dumps(st, indent=1))
+        log(f"{label} wake screen shown (was pending)")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--idle-hours", type=float, default=24, help="idle threshold (default 24)")
+    ap.add_argument("--dry-run", action="store_true", help="only report what would happen")
+    ap.add_argument("--pane", help="only consider this herdr pane id (e.g. wN:p7); sleeps it even if focused")
+    ap.add_argument("--session", help="herdr session name (default: the default session)")
+    ap.add_argument("-v", "--verbose", action="store_true", help="also list skipped sessions")
+    args = ap.parse_args()
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock = open(STATE_DIR / ".lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log("another claude-sleeper run is in progress; exiting")
+        return 0
+
+    finish_pending(args.session, args.dry_run)
+    try:
+        agents = herdr(args.session, "agent", "list")["agents"]
+    except (HerdrError, OSError, subprocess.TimeoutExpired) as e:
+        log(f"cannot list herdr agents: {e}")
+        return 1
+    agents = [a for a in agents if a.get("agent") == "claude"
+              and (not args.pane or a.get("pane_id") == args.pane)]
+    now, slept, failed = time.time(), 0, 0
+    for agent in sorted(agents, key=lambda a: a["pane_id"]):
+        try:
+            # Naming a pane with --pane is explicit intent, so the focus guard does not apply.
+            verdict, reason, info = evaluate(agent, args.session, args.idle_hours * 3600, now,
+                                             ignore_focus=bool(args.pane))
+        except (HerdrError, OSError, ValueError, subprocess.TimeoutExpired) as e:
+            log(f"{agent['pane_id']:8} ERROR evaluating: {e}")
+            failed += 1
+            continue
+        label = f"{info['pane_id']:8} {(info.get('name') or '')[:26]:26} {info['title'][:40]:40}"
+        if verdict == "skip":
+            if args.verbose or args.dry_run:
+                log(f"{label} keep   ({reason})")
+            continue
+        if args.dry_run:
+            keep, dropped = resume_args(info["argv"])
+            extra = f"; resume flags: {' '.join(keep)}" if keep else ""
+            extra += f"; drops: {' '.join(dropped)}" if dropped else ""
+            log(f"{label} SLEEP  ({reason}, pid {info['pid']}{extra})")
+            slept += 1
+            continue
+        try:
+            result = put_to_sleep(info, args.session)
+        except (HerdrError, OSError, subprocess.TimeoutExpired) as e:
+            result = f"ERROR: {e}"
+        log(f"{label} {result} ({reason}, session {info['session_id']})")
+        if result.startswith("asleep"):
+            slept += 1
+        elif result.startswith(("ERROR", "WARNING")):
+            failed += 1
+    verb = "would sleep" if args.dry_run else "slept"
+    log(f"done: {len(agents)} claude sessions checked, {verb} {slept}, errors {failed}")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

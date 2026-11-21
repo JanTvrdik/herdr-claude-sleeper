@@ -1,0 +1,7 @@
+[Unit]
+Description=Put long-idle Claude Code sessions in herdr panes to sleep
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
+ExecStart=%h/.local/bin/claude-sleeper --idle-hours 24
