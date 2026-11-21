@@ -168,7 +168,7 @@ def evaluate(agent, session, idle_secs, now, ignore_focus=False):
         return "skip", "pane is focused", info
     procs = herdr(session, "pane", "process-info", "--pane", pane)["process_info"]
     claudes = [p for p in procs["foreground_processes"]
-               if p["name"] == "claude" or os.path.basename(p["argv"][0]) == "claude"]
+               if p.get("name") == "claude" or os.path.basename((p.get("argv") or [""])[0]) == "claude"]
     if len(claudes) != 1:
         return "skip", f"{len(claudes)} claude processes in foreground", info
     proc = claudes[0]
@@ -199,6 +199,15 @@ def evaluate(agent, session, idle_secs, now, ignore_focus=False):
     return "sleep", f"idle {idle_h:.1f}h", info
 
 
+def has_exited(pid):
+    """True once the process is gone or only a zombie waiting to be reaped."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return True
+    return stat.rsplit(")", 1)[1].split()[0] == "Z"
+
+
 def put_to_sleep(info, session):
     pid, sid, pane = info["pid"], info["session_id"], info["pane_id"]
     # Re-check right before acting: the user may have just come back.
@@ -217,7 +226,7 @@ def put_to_sleep(info, session):
     state_file.write_text(json.dumps(state, indent=1))
     os.kill(pid, signal.SIGTERM)
     for _ in range(60):
-        if not Path(f"/proc/{pid}").exists():
+        if has_exited(pid):
             break
         time.sleep(0.25)
     else:
@@ -226,24 +235,112 @@ def put_to_sleep(info, session):
     note = f" (dropped args: {' '.join(dropped)})" if dropped else ""
     # Prompt hooks (e.g. direnv) may keep the shell busy for a while after claude
     # exits; then later runs type the wake command once the shell is free.
-    for _ in range(40):
-        busy = shell_busy(session, pane)
-        if not busy:
-            herdr(session, "pane", "run", pane, f" {WAKE} {sid}")
-            return f"asleep{note}"
-        time.sleep(0.25)
+    # claude is already stopped here, so any failure must leave the session
+    # recoverable: wake_pending makes the next run show the wake screen.
+    try:
+        busy = wait_for_prompt(session, pane, 10)
+        if busy is None:
+            return f"asleep{note}{show_wake_screen(session, pane, sid)}"
+        why = f"shell busy with `{busy[:80]}`"
+    except Exception as e:  # noqa: BLE001 - see comment above
+        why = f"error: {type(e).__name__}: {e}"
     state["wake_pending"] = True
     state_file.write_text(json.dumps(state, indent=1))
-    return f"asleep, wake screen pending: shell busy with `{busy[:80]}`{note}"
+    return f"asleep, wake screen pending: {why}{note}"
+
+
+def wait_for_prompt(session, pane, secs):
+    """None once the pane's shell is at its prompt, else what still keeps it busy after `secs`."""
+    busy = "?"
+    for _ in range(int(secs * 4)):
+        busy = shell_busy(session, pane)
+        if not busy:
+            return None
+        time.sleep(0.25)
+    return busy
+
+
+def herdr_released(session, pane, secs):
+    """Wait until herdr no longer has the stopped claude (or its session) attached to the pane."""
+    for _ in range(int(secs * 4)):
+        p = herdr(session, "pane", "get", pane)["pane"]
+        if not p.get("agent_session") and p.get("agent") != "claude":
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def show_wake_screen(session, pane, sid):
+    """Start claude-wake in a pane whose shell is at its prompt; returns a note for the log.
+
+    herdr lets go of an exited claude only when it sees the pane sitting at an idle shell
+    prompt. If claude-wake takes over the prompt before that, herdr keeps the old claude
+    session attached for good: a herdr restart would resume claude instead of the 💤 screen,
+    and claude-wake cannot register its own resume command. So wait for herdr to let go. If
+    it missed claude's exit, a 1-second dummy process named `claude` makes herdr see an
+    agent exit again (the only way found to get it unstuck).
+    """
+    note = ""
+    if not herdr_released(session, pane, 10):
+        herdr(session, "pane", "run", pane, f" {nudge_command()} 1")
+        time.sleep(1.5)
+        if wait_for_prompt(session, pane, 10) is None and herdr_released(session, pane, 10):
+            note = " (herdr needed a nudge to release the old claude)"
+        else:
+            note = " WARNING: herdr kept the old claude session; a herdr restart resumes claude here"
+    herdr(session, "pane", "run", pane, f" {WAKE} {sid}")
+    return note
+
+
+def nudge_command():
+    """A `sleep` that herdr sees as a process named claude (see show_wake_screen)."""
+    link = STATE_DIR / "nudge" / "claude"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if not link.is_symlink():
+        link.symlink_to(shutil.which("sleep") or "/usr/bin/sleep")
+    return str(link)
+
+
+def rewake(session, only_pane, dry_run):
+    """Restart the 💤 screen in sleeping panes: after updating claude-wake (running copies keep
+    the old code), or to repair a pane whose herdr registration is missing."""
+    done = 0
+    for f in sorted(STATE_DIR.glob("*.json")):
+        try:
+            st = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        sid, pane = st["session_id"], st["pane_id"]
+        if st.get("herdr_session") != session or (only_pane and pane != only_pane):
+            continue
+        label = f"{pane:8} {(st.get('name') or '')[:26]:26} {st.get('title', '')[:40]:40}"
+        try:
+            procs = herdr(session, "pane", "process-info", "--pane", pane)["process_info"]
+            if not any(f"claude-wake {sid}" in (p.get("cmdline") or "") for p in procs["foreground_processes"]):
+                log(f"{label} not showing its 💤 screen; left alone")
+                continue
+            if dry_run:
+                log(f"{label} would restart its 💤 screen")
+                continue
+            herdr(session, "pane", "send-keys", pane, "ctrl+c")  # claude-wake exits, session stays asleep
+            if wait_for_prompt(session, pane, 10) is not None:
+                log(f"{label} ERROR: shell not back at its prompt; run ' claude-wake {sid}' there")
+                continue
+            log(f"{label} 💤 screen restarted{show_wake_screen(session, pane, sid)}")
+            done += 1
+        except Exception as e:  # noqa: BLE001 - keep going with the other panes
+            log(f"{label} ERROR: {type(e).__name__}: {e}")
+    log(f"done: restarted {done} 💤 screens")
 
 
 def shell_busy(session, pane):
     """None if the pane's shell is at its prompt, else the busy foreground command."""
     procs = herdr(session, "pane", "process-info", "--pane", pane)["process_info"]
     fg = procs["foreground_processes"]
-    if len(fg) == 1 and fg[0]["pid"] == procs["shell_pid"]:
+    if len(fg) == 1 and fg[0].get("pid") == procs["shell_pid"]:
         return None
-    return " | ".join(p["cmdline"] for p in fg if p["pid"] != procs["shell_pid"]) or "?"
+    return " | ".join(p.get("cmdline") or p.get("name") or str(p.get("pid"))
+                      for p in fg if p.get("pid") != procs["shell_pid"]) or "?"
 
 
 def finish_pending(session, dry_run):
@@ -271,13 +368,13 @@ def finish_pending(session, dry_run):
             if dry_run:
                 log(f"{label} would type the pending wake command")
                 continue
-            herdr(session, "pane", "run", pane, f" {WAKE} {sid}")
-        except (HerdrError, OSError, subprocess.TimeoutExpired) as e:
-            log(f"{label} pending wake failed: {e}")
+            note = show_wake_screen(session, pane, sid)
+        except Exception as e:  # noqa: BLE001 - keep going with the other sessions
+            log(f"{label} pending wake failed: {type(e).__name__}: {e}")
             continue
         st["wake_pending"] = False
         f.write_text(json.dumps(st, indent=1))
-        log(f"{label} wake screen shown (was pending)")
+        log(f"{label} wake screen shown (was pending){note}")
 
 
 def main():
@@ -287,6 +384,9 @@ def main():
     ap.add_argument("--pane", help="only consider this herdr pane id (e.g. wN:p7); sleeps it even if focused")
     ap.add_argument("--session", help="herdr session name (default: the default session)")
     ap.add_argument("-v", "--verbose", action="store_true", help="also list skipped sessions")
+    ap.add_argument("--rewake", action="store_true",
+                    help="restart the 💤 screen in sleeping panes (all, or --pane) and exit; "
+                         "use after updating claude-wake or to repair herdr registration")
     args = ap.parse_args()
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -297,6 +397,9 @@ def main():
         log("another claude-sleeper run is in progress; exiting")
         return 0
 
+    if args.rewake:
+        rewake(args.session, args.pane, args.dry_run)
+        return 0
     finish_pending(args.session, args.dry_run)
     try:
         agents = herdr(args.session, "agent", "list")["agents"]
@@ -311,8 +414,8 @@ def main():
             # Naming a pane with --pane is explicit intent, so the focus guard does not apply.
             verdict, reason, info = evaluate(agent, args.session, args.idle_hours * 3600, now,
                                              ignore_focus=bool(args.pane))
-        except (HerdrError, OSError, ValueError, subprocess.TimeoutExpired) as e:
-            log(f"{agent['pane_id']:8} ERROR evaluating: {e}")
+        except Exception as e:  # noqa: BLE001 - keep going with the other sessions
+            log(f"{agent['pane_id']:8} ERROR evaluating: {type(e).__name__}: {e}")
             failed += 1
             continue
         label = f"{info['pane_id']:8} {(info.get('name') or '')[:26]:26} {info['title'][:40]:40}"
@@ -329,8 +432,8 @@ def main():
             continue
         try:
             result = put_to_sleep(info, args.session)
-        except (HerdrError, OSError, subprocess.TimeoutExpired) as e:
-            result = f"ERROR: {e}"
+        except Exception as e:  # noqa: BLE001 - keep going with the other sessions
+            result = f"ERROR: {type(e).__name__}: {e}"
         log(f"{label} {result} ({reason}, session {info['session_id']})")
         if result.startswith("asleep"):
             slept += 1

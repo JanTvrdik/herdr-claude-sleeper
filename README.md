@@ -64,6 +64,7 @@ claude-sleeper [--idle-hours N] [--dry-run] [--pane ID] [--session NAME] [-v]
 | `--pane ID` | Only consider this herdr pane (e.g. `wN:p7`). Also sleeps it if it is focused. |
 | `--session NAME` | Target a named herdr session instead of the default one. |
 | `-v` | Also log the sessions that are kept. |
+| `--rewake` | Restart the 💤 screen in all sleeping panes (or one with `--pane`) and exit. Use it after updating `claude-wake` (running copies keep the old code) or to repair a pane's herdr registration. |
 
 Examples:
 
@@ -97,14 +98,24 @@ the meantime is left alone.
 1. Writes the session's details to `~/.local/state/claude-sleeper/<session-id>.json`: folder, title,
    launch flags to keep, pane, timestamps.
 2. Sends claude `SIGTERM`. Claude Code exits cleanly within a second; the transcript is already on disk.
-3. Waits for the pane's shell to be back at its prompt, then types ` claude-wake <session-id>` into
-   it with `herdr pane run` (the leading space keeps it out of history if `HISTCONTROL` ignores spaces).
+3. Waits for the pane's shell to be back at its prompt.
+4. Waits for herdr to let go of the stopped claude. herdr does that only when it sees the pane sitting
+   at an idle shell prompt after the agent's process exited, usually within a second. If anything takes
+   over the prompt before that, herdr keeps the old claude session attached for good: after a restart it
+   would resume claude instead of the 💤 screen, and claude-wake could not register. If herdr has not let
+   go after 10 seconds, claude-sleeper runs a 1-second `sleep` under the name `claude` in the pane, so
+   herdr sees an agent exit again and lets go. It is a workaround, but the only way found to unstick herdr.
+5. Types ` claude-wake <session-id>` into the shell with `herdr pane run` (the leading space keeps it
+   out of history if `HISTCONTROL` ignores spaces).
 
 **The 💤 screen** (`claude-wake`):
 
 - Registers itself with herdr as a custom agent (`--source custom:claude-sleeper --agent claude-sleeper`)
   whose resume command is `claude-wake <session-id>`. herdr saves that in its session file, so after a
   herdr restart or reboot it reopens the pane in the same folder and runs `claude-wake` again.
+  It registers in two steps, because herdr accepts a resume command only from a source that already
+  holds the pane. It re-sends the registration after 3, 10, 30 and 60 seconds and then every 5 minutes,
+  which repairs a registration that failed or was cleared.
 - On a keypress: unregisters from herdr, deletes the state file, and replaces itself with
   `claude --resume <session-id> <kept flags>` in the original folder. Claude's own herdr integration
   then reports the session, and herdr's built-in Claude resume covers it from then on.
@@ -156,6 +167,10 @@ skipping that check, turn the check off in `.envrc` and run `aws sso login` your
 - herdr writes its session file a few seconds after a change. A reboot within about 6 seconds of a
   session going to sleep or waking restores the previous state.
 - Only panes herdr recognizes as claude are considered. Sessions outside herdr are never touched.
+- The rules for when herdr lets a source hold a pane, and when it lets go of an exited agent, are not
+  documented. The waiting and the `claude` dummy above are based on observed behavior of herdr 0.9.5.
+- Each 💤 screen is a small Python process, about 14 MB, compared with 350–600 MB for an idle claude.
+- `~/.local/state/claude-sleeper/nudge/claude` is a symlink to `sleep`, used for the dummy above.
 
 ## Uninstall
 

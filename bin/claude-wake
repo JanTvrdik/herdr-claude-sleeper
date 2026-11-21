@@ -26,19 +26,38 @@ HERDR_SOURCE = "custom:claude-sleeper"
 HERDR_AGENT = "claude-sleeper"
 
 
+# While waiting for a key, re-send the herdr registration at these offsets (seconds), then
+# every REREGISTER_EVERY. Re-sending is idempotent; it repairs a registration that failed
+# (herdr still holding the stopped claude) or was cleared afterwards.
+REGISTER_SCHEDULE = (3, 10, 30, 60)
+REREGISTER_EVERY = 300
+
+
 def herdr_pane(command, *args):
-    """Best effort `herdr pane <command> <this pane> ...`; never breaks the wake screen."""
+    """Best effort `herdr pane <command> <this pane> ...`; True on success, never raises."""
     pane = os.environ.get("HERDR_PANE_ID")
     herdr = shutil.which("herdr") or os.environ.get("HERDR_BIN_PATH")
     if os.environ.get("HERDR_ENV") != "1" or not pane or not herdr:
-        return
+        return False
     try:
-        subprocess.run(
+        return subprocess.run(
             [herdr, "pane", command, pane, "--source", HERDR_SOURCE, "--agent", HERDR_AGENT,
              "--seq", str(time.time_ns()), *args],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=5).returncode == 0
     except (OSError, subprocess.SubprocessError):
-        pass
+        return False
+
+
+def register(sid, title):
+    """Hold the pane so a herdr restart runs `claude-wake <sid>` here again.
+
+    Two steps: herdr accepts a resume command only from a source that already holds the
+    pane, and a combined report is rejected when the state part has not been applied yet.
+    """
+    message = f"💤 sleeping: {title}"
+    herdr_pane("report-agent", "--state", "idle", "--message", message)
+    return herdr_pane("report-agent", "--state", "idle", "--message", message, "--", "claude-wake", sid)
 
 
 def ago(ts):
@@ -46,12 +65,24 @@ def ago(ts):
     return f"{h:.0f}h ago" if h < 48 else f"{h / 24:.0f}d ago"
 
 
-def read_key():
-    """Read one keypress; True to resume, False on Ctrl+C / Ctrl+D."""
+def read_key(on_idle):
+    """Read one keypress; True to resume, False on Ctrl+C / Ctrl+D.
+
+    on_idle() runs on the REGISTER_SCHEDULE while no key has been pressed.
+    """
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
+    start = time.monotonic()
+    offsets = list(REGISTER_SCHEDULE)
     try:
         tty.setraw(fd)
+        while True:
+            if not offsets:
+                offsets.append(time.monotonic() - start + REREGISTER_EVERY)
+            if select.select([fd], [], [], max(0.0, start + offsets[0] - time.monotonic()))[0]:
+                break
+            offsets.pop(0)
+            on_idle()
         ch = os.read(fd, 1)
         # Swallow the rest of multi-byte keys (arrows etc.) so they don't reach claude.
         while select.select([fd], [], [], 0.05)[0]:
@@ -82,11 +113,9 @@ def main():
     print(f"      session       {sid}\n")
     print("      Press any key to resume · Ctrl+C to leave it asleep\n", flush=True)
 
-    # Hold the pane so a herdr restart runs `claude-wake <sid>` here again.
-    herdr_pane("report-agent", "--state", "idle", "--message", f"💤 sleeping: {title}",
-               "--", "claude-wake", sid)
+    register(sid, title)
     try:
-        resume = read_key()
+        resume = read_key(lambda: register(sid, title))
     except KeyboardInterrupt:
         resume = False
     herdr_pane("release-agent")
