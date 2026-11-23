@@ -96,7 +96,7 @@ the meantime is left alone.
 **Going to sleep** (`claude-sleeper`):
 
 1. Writes the session's details to `~/.local/state/claude-sleeper/<session-id>.json`: folder, title,
-   launch flags to keep, pane, timestamps.
+   launch flags to keep, pane, timestamps. The folder is readable only by you (mode 0700).
 2. Sends claude `SIGTERM`. Claude Code exits cleanly within a second; the transcript is already on disk.
 3. Waits for the pane's shell to be back at its prompt.
 4. Waits for herdr to let go of the stopped claude. herdr does that only when it sees the pane sitting
@@ -124,7 +124,8 @@ the meantime is left alone.
 **Launch flags.** Flags that shape the session are kept, e.g. `--model`, `--permission-mode`,
 `--dangerously-skip-permissions`, `--add-dir`, `--settings`, `--mcp-config`, `--remote-control`.
 Flags that choose or create a session are dropped (`--resume`, `--continue`, `--session-id`,
-`--fork-session`, `--worktree`), and so is an initial prompt.
+`--fork-session`, `--worktree`), and so is an initial prompt. The log names dropped flags, but not
+their values or the prompt.
 
 ## What survives a sleep
 
@@ -183,3 +184,7 @@ rm ~/.config/systemd/user/claude-sleeper.service ~/.config/systemd/user/claude-s
 rm ~/.local/bin/claude-sleeper ~/.local/bin/claude-wake
 systemctl --user daemon-reload
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE).

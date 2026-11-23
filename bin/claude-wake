@@ -5,12 +5,13 @@ Typed into a herdr pane by claude-sleeper after it stopped an idle session.
 Ctrl+C leaves the session asleep; run `claude-wake <session-id>` again later.
 
 While the screen is up, this process holds its herdr pane as a custom agent whose
-resume command is `claude-wake <session-id>`, so a herdr restart (or VM reboot)
+resume command is `claude-wake <session-id>`, so a herdr restart (or a reboot)
 brings the sleeping screen back instead of a plain shell. The pane is released
 before claude starts; claude's own herdr integration takes over from there.
 """
 import json
 import os
+import re
 import select
 import shutil
 import subprocess
@@ -24,6 +25,7 @@ from pathlib import Path
 STATE_DIR = Path.home() / ".local/state/claude-sleeper"
 HERDR_SOURCE = "custom:claude-sleeper"
 HERDR_AGENT = "claude-sleeper"
+SESSION_ID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
 # While waiting for a key, re-send the herdr registration at these offsets (seconds), then
@@ -96,6 +98,8 @@ def main():
     if len(sys.argv) != 2:
         sys.exit(__doc__.strip())
     sid = sys.argv[1]
+    if not SESSION_ID.fullmatch(sid):
+        sys.exit(f"claude-wake: not a Claude Code session id: {sid}")
     state_file = STATE_DIR / f"{sid}.json"
     try:
         st = json.loads(state_file.read_text())

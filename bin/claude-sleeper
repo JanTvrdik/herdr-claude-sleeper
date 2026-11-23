@@ -20,6 +20,8 @@ import argparse
 import fcntl
 import json
 import os
+import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -35,6 +37,8 @@ PROJECTS_DIR = HOME / ".claude/projects"
 WAKE = shutil.which("claude-wake") or str(HOME / ".local/bin/claude-wake")
 PENDING_GIVE_UP_SECS = 2 * 3600  # stop trying to type a pending wake command after this
 HERDR = shutil.which("herdr") or str(HOME / ".local/bin/herdr")
+# Claude Code session ids are UUIDs. Anything else is never typed into a shell or used in a path.
+SESSION_ID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 # claude CLI flags: how many values each takes (0, 1, "?" optional, "*" variadic).
 ARITY = {
@@ -88,13 +92,16 @@ def herdr(session, *args):
 
 
 def resume_args(argv):
-    """Split claude's original argv into (kept flags, dropped tokens)."""
+    """Split claude's original argv into (kept flags with their values, names of dropped flags).
+
+    Values of dropped flags and the initial prompt are left out: the names end up in logs."""
     keep, dropped, toks, i = [], [], argv[1:], 0
     while i < len(toks):
         t = toks[i]
         i += 1
         if not t.startswith("-") or t == "-":
-            dropped.append(t)  # positional: the initial prompt
+            if "initial prompt" not in dropped:
+                dropped.append("initial prompt")  # positional
             continue
         flag, has_inline = (t.split("=", 1)[0], True) if "=" in t else (t, False)
         group = [t]
@@ -110,7 +117,7 @@ def resume_args(argv):
         if flag in KEEP:
             keep.extend(group)
         elif flag not in EXPECTED_DROPS:
-            dropped.extend(group)
+            dropped.append(flag)
     return keep, dropped
 
 
@@ -179,8 +186,8 @@ def evaluate(agent, session, idle_secs, now, ignore_focus=False):
         return "skip", "no claude session registry entry", info
     info["registry_updated"] = reg.get("statusUpdatedAt")
     sid = reg.get("sessionId") or (agent.get("agent_session") or {}).get("value")
-    if not sid:
-        return "skip", "unknown session id", info
+    if not isinstance(sid, str) or not SESSION_ID.fullmatch(sid):
+        return "skip", "no valid session id", info
     info.update(session_id=sid, name=reg.get("name"))
     if reg.get("status") != "idle":
         return "skip", f"claude status {reg.get('status')}", info
@@ -215,10 +222,9 @@ def put_to_sleep(info, session):
     if not reg or reg.get("status") != "idle" or reg.get("statusUpdatedAt") != info["registry_updated"]:
         return "session became active, left alone"
     keep, dropped = resume_args(info["argv"])
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
     state = {
         "session_id": sid, "name": info.get("name"), "title": info["title"], "cwd": info["cwd"],
-        "resume_args": keep, "dropped_args": dropped, "original_argv": info["argv"],
+        "resume_args": keep, "dropped_args": dropped,
         "pane_id": pane, "herdr_session": session, "idle_since": info["idle_since"],
         "slept_at": time.time(),
     }
@@ -232,7 +238,7 @@ def put_to_sleep(info, session):
     else:
         state_file.unlink(missing_ok=True)
         return "ERROR: claude did not exit within 15s after SIGTERM; left it running"
-    note = f" (dropped args: {' '.join(dropped)})" if dropped else ""
+    note = f" (dropped: {', '.join(dropped)})" if dropped else ""
     # Prompt hooks (e.g. direnv) may keep the shell busy for a while after claude
     # exits; then later runs type the wake command once the shell is free.
     # claude is already stopped here, so any failure must leave the session
@@ -282,13 +288,13 @@ def show_wake_screen(session, pane, sid):
     """
     note = ""
     if not herdr_released(session, pane, 10):
-        herdr(session, "pane", "run", pane, f" {nudge_command()} 1")
+        herdr(session, "pane", "run", pane, f" {shlex.quote(nudge_command())} 1")
         time.sleep(1.5)
         if wait_for_prompt(session, pane, 10) is None and herdr_released(session, pane, 10):
             note = " (herdr needed a nudge to release the old claude)"
         else:
             note = " WARNING: herdr kept the old claude session; a herdr restart resumes claude here"
-    herdr(session, "pane", "run", pane, f" {WAKE} {sid}")
+    herdr(session, "pane", "run", pane, f" {shlex.quote(WAKE)} {shlex.quote(sid)}")
     return note
 
 
@@ -389,7 +395,11 @@ def main():
                          "use after updating claude-wake or to repair herdr registration")
     args = ap.parse_args()
 
+    # State files hold launch flags, whose values (inline --settings or --mcp-config JSON,
+    # system prompts) may be private. Keep them readable only by this user.
+    os.umask(0o077)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.chmod(0o700)  # also fixes state dirs created by older versions
     lock = open(STATE_DIR / ".lock", "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -426,7 +436,7 @@ def main():
         if args.dry_run:
             keep, dropped = resume_args(info["argv"])
             extra = f"; resume flags: {' '.join(keep)}" if keep else ""
-            extra += f"; drops: {' '.join(dropped)}" if dropped else ""
+            extra += f"; drops: {', '.join(dropped)}" if dropped else ""
             log(f"{label} SLEEP  ({reason}, pid {info['pid']}{extra})")
             slept += 1
             continue
