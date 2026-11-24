@@ -39,6 +39,7 @@ PENDING_GIVE_UP_SECS = 2 * 3600  # stop trying to type a pending wake command af
 HERDR = shutil.which("herdr") or str(HOME / ".local/bin/herdr")
 # Claude Code session ids are UUIDs. Anything else is never typed into a shell or used in a path.
 SESSION_ID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+HAS_PROC = Path("/proc/self").exists()  # without it (macOS), process details come from ps
 
 # claude CLI flags: how many values each takes (0, 1, "?" optional, "*" variadic).
 ARITY = {
@@ -142,18 +143,38 @@ def last_transcript_ts(session_id):
     return None
 
 
-def background_jobs(pid):
-    """Children of claude that are Bash-tool commands (background jobs, monitors)."""
-    jobs = []
+def ps(*args):
+    """Output lines of `ps`, for systems without /proc (macOS), and its exit status."""
+    p = subprocess.run(["ps", *args], capture_output=True, text=True, timeout=30)
+    return p.stdout.splitlines(), p.returncode
+
+
+def children(pid):
+    """(pid, command line) of each direct child of pid."""
+    out = []
+    if not HAS_PROC:
+        lines, status = ps("-A", "-o", "pid=,ppid=,command=")
+        if status != 0:
+            # Finding no children here would let a session with background jobs go to sleep.
+            raise OSError(f"ps -A exited with status {status}")
+        for line in lines:
+            fields = line.split(None, 2)
+            if len(fields) >= 2 and fields[1] == str(pid):
+                out.append((fields[0], fields[2] if len(fields) == 3 else ""))
+        return out
     for task in Path(f"/proc/{pid}/task").glob("*/children"):
         for child in task.read_text().split():
             try:
                 cmd = Path(f"/proc/{child}/cmdline").read_bytes().replace(b"\0", b" ").decode()
             except OSError:
                 continue
-            if "/.claude/shell-snapshots/" in cmd:
-                jobs.append(child)
-    return jobs
+            out.append((child, cmd))
+    return out
+
+
+def background_jobs(pid):
+    """Children of claude that are Bash-tool commands (background jobs, monitors)."""
+    return [child for child, cmd in children(pid) if "/.claude/shell-snapshots/" in cmd]
 
 
 def read_registry(pid):
@@ -208,6 +229,16 @@ def evaluate(agent, session, idle_secs, now, ignore_focus=False):
 
 def has_exited(pid):
     """True once the process is gone or only a zombie waiting to be reaped."""
+    if not HAS_PROC:
+        try:
+            stat, _ = ps("-o", "stat=", "-p", str(pid))  # exits 1 with no output once pid is gone
+        except (OSError, subprocess.SubprocessError):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            return False
+        return not stat or stat[0].strip().startswith("Z")
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
     except OSError:
