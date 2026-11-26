@@ -94,6 +94,12 @@ def read_key(on_idle):
     return ch not in (b"\x03", b"\x04", b"")
 
 
+def set_title(text):
+    """Set the terminal / herdr tab title. Control characters would end the escape sequence early."""
+    text = re.sub(r"[\x00-\x1f\x7f]", "", text)
+    sys.stdout.write(f"\033]0;{text}\007")
+
+
 def main():
     if len(sys.argv) != 2:
         sys.exit(__doc__.strip())
@@ -107,8 +113,8 @@ def main():
         sys.exit(f"claude-wake: no sleeping session {sid}; try: claude --resume {sid}")
 
     title = st.get("title") or st.get("name") or sid
-    sys.stdout.write(f"\033]0;💤 {title}\007")   # terminal / herdr tab title
-    sys.stdout.write("\033[H\033[2J")             # clear screen, keep scrollback
+    set_title(f"💤 {title}")
+    sys.stdout.write("\033[H\033[2J")  # clear screen, keep scrollback
     print(f"\n  💤  Claude is sleeping\n")
     print(f"      {title}")
     print(f"      {st['cwd']}\n")
@@ -123,6 +129,9 @@ def main():
     except KeyboardInterrupt:
         resume = False
     herdr_pane("release-agent")
+    # Put back the title from before the sleep (empty clears it): claude does not set one,
+    # so the 💤 would otherwise stay on the resumed session's tab.
+    set_title(st.get("title") or "")
     if not resume:
         print(f"  Still asleep. Resume later with: claude-wake {sid}")
         sys.exit(130)
