@@ -10,7 +10,7 @@ so the process can be stopped and brought back later with `claude --resume <id>`
 
 claude-sleeper does that automatically:
 
-- Every 15 minutes, a systemd timer checks all claude panes in herdr.
+- Every 15 minutes, a systemd timer (Linux) or launchd agent (macOS) checks all claude panes in herdr.
 - A session idle for more than 24 hours is stopped and replaced by a placeholder screen in the same pane:
 
   ```
@@ -31,7 +31,8 @@ claude-sleeper does that automatically:
 
 ## Requirements
 
-- Linux (reads `/proc`), Python 3, a systemd user session
+- Linux with a systemd user session, or macOS (launchd)
+- Python 3.9 or newer at `/usr/bin/python3` (on macOS it comes with the Xcode Command Line Tools)
 - herdr 0.9.2 or newer (custom agent resume commands); tested with 0.9.5
 - Claude Code, tested with 2.1.330; the herdr Claude integration installed (`herdr integration install claude`)
 - `~/.local/bin` on `PATH` in your pane shells
@@ -42,14 +43,32 @@ claude-sleeper does that automatically:
 ./install.sh
 ```
 
-This symlinks `bin/claude-sleeper` and `bin/claude-wake` into `~/.local/bin`, and links the units in
-`systemd/` with `systemctl --user link`. Edits in this repo take effect directly. Re-running it is safe.
-It does not enable the timer. Check with a dry run first, then enable it:
+This symlinks `bin/claude-sleeper` and `bin/claude-wake` into `~/.local/bin`. Edits in this repo take
+effect directly. Re-running it is safe. It does not enable the timer. Check with a dry run first, then
+enable it.
+
+**Linux:** the units in `systemd/` are linked with `systemctl --user link`.
 
 ```sh
 claude-sleeper --dry-run
 systemctl --user enable --now claude-sleeper.timer
 ```
+
+**macOS:** `launchd/claude-sleeper.plist` is filled in with your home directory and a `PATH` that
+includes herdr's folder (launchd starts agents with a bare `PATH`), and written to
+`~/Library/LaunchAgents/local.claude-sleeper.plist`. It is a copy, not a link: after a change to the
+template, re-run `./install.sh` and reload the agent as it tells you. The plist is marked `Disabled`,
+so it does not start at your next login on its own. `launchctl enable` overrides that, and must come
+before `bootstrap`, which otherwise fails with `Bootstrap failed: 5: Input/output error`.
+
+```sh
+claude-sleeper --dry-run
+launchctl enable gui/$(id -u)/local.claude-sleeper
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.claude-sleeper.plist
+```
+
+The agent gets only `HOME` and that `PATH`. If you run herdr with a custom `XDG_CONFIG_HOME` or
+`HERDR_SOCKET_PATH`, add it to the plist's `EnvironmentVariables`, or herdr cannot be reached.
 
 ## Usage
 
@@ -71,7 +90,8 @@ Examples:
 ```sh
 claude-sleeper --dry-run                        # what would the timer do right now?
 claude-sleeper --pane wN:p7 --idle-hours 0      # put one pane to sleep immediately
-journalctl --user -u claude-sleeper             # what has the timer done?
+journalctl --user -u claude-sleeper             # what has the timer done? (Linux)
+tail ~/Library/Logs/claude-sleeper.log          # what has the timer done? (macOS)
 claude-wake <session-id>                        # bring back a 💤 screen you left with Ctrl+C
 ```
 
@@ -157,6 +177,8 @@ skipping that check, turn the check off in `.envrc` and run `aws sso login` your
 | `~/.local/state/claude-sleeper/<session-id>.json` | One per sleeping session; deleted on wake |
 | `~/.local/state/claude-sleeper/.lock` | Prevents overlapping runs |
 | `~/.config/herdr/session.json` | herdr's saved session; sleeping panes appear as `agent_resume` |
+| `~/Library/LaunchAgents/local.claude-sleeper.plist` | macOS: the launchd agent written by `install.sh` |
+| `~/Library/Logs/claude-sleeper.log` | macOS: the log; not rotated, it grows by about 10 KB a day |
 
 ## Known limits
 
@@ -179,10 +201,18 @@ Wake the sleeping sessions first, or resume them later with `claude --resume <id
 file names in `~/.local/state/claude-sleeper/`). Then:
 
 ```sh
+# Linux
 systemctl --user disable --now claude-sleeper.timer
 rm ~/.config/systemd/user/claude-sleeper.service ~/.config/systemd/user/claude-sleeper.timer
-rm ~/.local/bin/claude-sleeper ~/.local/bin/claude-wake
 systemctl --user daemon-reload
+
+# macOS
+launchctl bootout gui/$(id -u)/local.claude-sleeper
+launchctl disable gui/$(id -u)/local.claude-sleeper
+rm ~/Library/LaunchAgents/local.claude-sleeper.plist ~/Library/Logs/claude-sleeper.log
+
+# both
+rm ~/.local/bin/claude-sleeper ~/.local/bin/claude-wake
 ```
 
 ## License

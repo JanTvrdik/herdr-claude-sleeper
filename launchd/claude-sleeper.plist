@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template: install.sh fills in the home directory and PATH and writes it to ~/Library/LaunchAgents.
+     Disabled, so it does not start at the next login until `launchctl enable` overrides this. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>local.claude-sleeper</string>
+	<key>Disabled</key>
+	<true/>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@HOME@/.local/bin/claude-sleeper</string>
+		<string>--idle-hours</string>
+		<string>24</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>@PATH@</string>
+	</dict>
+	<key>StartInterval</key>
+	<integer>900</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>@HOME@/Library/Logs/claude-sleeper.log</string>
+	<key>StandardErrorPath</key>
+	<string>@HOME@/Library/Logs/claude-sleeper.log</string>
+</dict>
+</plist>
