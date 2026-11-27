@@ -28,6 +28,7 @@ claude-sleeper does that automatically:
 
 - Any key resumes the same conversation in the same folder, with the same launch flags.
 - Sleeping panes survive a herdr restart or a reboot: herdr brings the placeholder back, not claude.
+- The **Sleep Claude in current pane** Herdr action puts an idle Claude session to sleep on demand.
 
 ## Requirements
 
@@ -43,18 +44,39 @@ claude-sleeper does that automatically:
 ```
 
 This symlinks `bin/claude-sleeper` and `bin/claude-wake` into `~/.local/bin`, and links the units in
-`systemd/` with `systemctl --user link`. Edits in this repo take effect directly. Re-running it is safe.
-It does not enable the timer. Check with a dry run first, then enable it:
+`systemd/` with `systemctl --user link`. It also links the Herdr plugin from this checkout. Edits
+in this repo take effect directly. Re-running it is safe. It does not enable the timer.
+Check with a dry run first, then enable it:
 
 ```sh
 claude-sleeper --dry-run
 systemctl --user enable --now claude-sleeper.timer
 ```
 
+## Sleep the current pane on demand
+
+The Herdr action **Sleep Claude in current pane** skips the 24-hour wait. It only considers the
+focused pane and still requires Claude to be idle with no running background jobs.
+
+To bind it to a shortcut, add this to `~/.config/herdr/config.toml`:
+
+```toml
+[[keys.command]]
+key = "prefix+shift+z"
+type = "plugin_action"
+command = "claude-sleeper.sleep-current"
+description = "Sleep Claude in current pane"
+```
+
+Choose **reload config** from the Herdr menu, then press your prefix (default `Ctrl+B`) followed by
+`Shift+Z` in the Claude pane. You can also invoke the action with
+`herdr plugin action invoke claude-sleeper.sleep-current` and see its result with
+`herdr plugin log list --plugin claude-sleeper --limit 1`.
+
 ## Usage
 
 ```
-claude-sleeper [--idle-hours N] [--dry-run] [--pane ID] [--session NAME] [-v]
+claude-sleeper [--idle-hours N] [--dry-run] [--pane ID | --current] [--session NAME] [-v]
 ```
 
 | Option | Meaning |
@@ -62,6 +84,7 @@ claude-sleeper [--idle-hours N] [--dry-run] [--pane ID] [--session NAME] [-v]
 | `--idle-hours N` | Idle threshold, default 24. The timer uses the default. |
 | `--dry-run` | Only report what would be put to sleep, and why the rest are kept. |
 | `--pane ID` | Only consider this herdr pane (e.g. `wN:p7`). Also sleeps it if it is focused. |
+| `--current` | Only consider the pane supplied by Herdr, even if focused. Uses the calling Herdr session. |
 | `--session NAME` | Target a named herdr session instead of the default one. |
 | `-v` | Also log the sessions that are kept. |
 | `--rewake` | Restart the 💤 screen in all sleeping panes (or one with `--pane`) and exit. Use it after updating `claude-wake` (running copies keep the old code) or to repair a pane's herdr registration. |
@@ -80,7 +103,7 @@ claude-wake <session-id>                        # bring back a 💤 screen you l
 All of these must hold, otherwise the session is left alone:
 
 - herdr does not report the agent as `working` or `blocked` (waiting on a permission prompt)
-- the pane is not focused (unless named with `--pane`)
+- the pane is not focused (unless targeted with `--pane` or `--current`)
 - exactly one claude process is in the pane's foreground
 - Claude Code's own session file (`~/.claude/sessions/<pid>.json`) says `status: idle`
 - no activity for `--idle-hours`, judged by the newer of that file's `statusUpdatedAt` and the last
@@ -179,11 +202,14 @@ Wake the sleeping sessions first, or resume them later with `claude --resume <id
 file names in `~/.local/state/claude-sleeper/`). Then:
 
 ```sh
+herdr plugin unlink claude-sleeper
 systemctl --user disable --now claude-sleeper.timer
 rm ~/.config/systemd/user/claude-sleeper.service ~/.config/systemd/user/claude-sleeper.timer
 rm ~/.local/bin/claude-sleeper ~/.local/bin/claude-wake
 systemctl --user daemon-reload
 ```
+
+Remove the `[[keys.command]]` entry for `claude-sleeper.sleep-current` if you added it.
 
 ## License
 
